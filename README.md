@@ -16,6 +16,11 @@
     $ sudo apt-get update
     $ sudo apt-get install libusb-1.0-0
     ~~~
+    Note: libusb requires root by default to change this add the following to etc/udev/rules.d/sh.rules
+    or download [Spike](https://signalhound.com/spike) and the setup will be done for you
+    ~~~
+    SUBSYSTEM=="usb", ATTR{idVendor}=="2817", MODE="0666", GROUP="plugdev"
+    ~~~
 2. FTDI D2XX library
 - grab latest 64-bit Linux driver from [FTDI Chip](www.ftdichip.com/Drivers/D2XX.htm) 
 - or find a copy of the library in the [Signal Hound SDK](https://signalhound.com/software/signal-hound-software-development-kit-sdk/) 
