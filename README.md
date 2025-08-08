@@ -13,7 +13,7 @@
 
 1. Libusb 1.0 
     ~~~
-    $ sudo aot-get update
+    $ sudo apt-get update
     $ sudo apt-get install libusb-1.0-0
     ~~~
 2. FTDI D2XX library
