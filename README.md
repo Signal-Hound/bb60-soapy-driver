@@ -52,6 +52,7 @@
     $ sudo make install
     $ sudo ldconfig
     ~~~
+Note: MATLAB runtime LD_LIBRARY_PATH environment variable may cause conflicts with cmake
 
 Note: if a BB60D or BB60C device is plugged in, `SoapySDRUtil --find` will display its serial number.
 
