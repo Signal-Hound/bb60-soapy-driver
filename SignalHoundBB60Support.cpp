@@ -5,6 +5,7 @@
 #include <iostream>
 #include <cstdint>
 #include <cstring>
+#include <mutex>
 
 #include "bb_api.h"
 
@@ -16,12 +17,14 @@
 class SignalHoundBB60 : public SoapySDR::Device {
 private:
     // Variables used
-    bool streamActive, serialSpecified, gainMode;
-    int deviceId, serial, type, decimation, rfGain, numDevices; 
+    mutable std::mutex devMutex;
+    bool streamActive, serialSpecified;
+    int deviceId, serial, type, decimation, numDevices; 
     int serials[BB_MAX_DEVICES], types[BB_MAX_DEVICES];
     unsigned int port1, port2;
-    double sampleRate, centerFrequency, bandwidth, refLevel, attenLevel;
+    double sampleRate, centerFrequency, bandwidth, rfGain, attenLevel;
     bbStatus status;
+    std::string dataFormat;
     // Decimation to max bandwidth with filters
     const std::map<int, double> bb60Decimation = {{8192, 4e3},
                                                  {4096, 8e3},
@@ -69,19 +72,17 @@ public:
         // Defaults
         streamActive = false;
         serialSpecified = false;
-        gainMode = false;
         deviceId = -1;
         type = 0;
         decimation = 1;
-        rfGain = 0;
         numDevices = -1;
         port1 = 0;
         port2 = 0;
         sampleRate = 0;
-        centerFrequency = 100e6;
+        centerFrequency = 1.0e9;
         bandwidth = BB60_CLOCK/decimation;
-        refLevel = -30;
-        attenLevel = 0;
+        rfGain = 0.0;
+        attenLevel = 0.0;
 
         if(args.count("serial") != 0) {
             try {
@@ -144,19 +145,6 @@ public:
                                             + std::to_string(serial));
         }
         type = types[deviceId];
-
-        // Configure device defaults
-        bbConfigureIQ(deviceId, decimation, bandwidth);
-        bbConfigureIQCenter(deviceId, centerFrequency);
-
-
-        // Configure ports
-        for(const auto &info : this->getSettingInfo()) {
-            const auto it = args.find(info.key);
-            if(it != args.end()) {
-                this->writeSetting(it->first, it->second);
-            }
-        }
     }
 
     ~SignalHoundBB60(void) 
@@ -176,6 +164,7 @@ public:
 
     std::string getHardwareKey(void) const
     {
+        const std::lock_guard<std::mutex> lock(devMutex);
         if(type == BB_DEVICE_BB60A) {
             return "Signal Hound BB60A";
         } else if(type == BB_DEVICE_BB60C) {
@@ -189,6 +178,7 @@ public:
 
     SoapySDR::Kwargs getHardwareInfo(void) const 
     {
+        const std::lock_guard<std::mutex> lock(devMutex);
         int firmware = 0;
         bbGetFirmwareVersion(deviceId, &firmware);
 
@@ -264,28 +254,21 @@ public:
                                   const std::vector<size_t> &channels = std::vector<size_t>(),
                                   const SoapySDR::Kwargs &args = SoapySDR::Kwargs()) 
     {
+        const std::lock_guard<std::mutex> lock(devMutex);
         // Check channel config
         if(channels.size() > 1 or (channels.size() > 0 and channels.at(0) != 0)) {
             throw std::runtime_error("setupStream invalid channel selection");
         }
 
-        // Check format
-        if(format == SOAPY_SDR_CF32) {
-            SoapySDR_log(SOAPY_SDR_INFO, "Using format CF32");
-            bbConfigureIQDataType(deviceId, bbDataType32fc);
-        } else if(format == SOAPY_SDR_CS16) {
-            SoapySDR_log(SOAPY_SDR_INFO, "Using format CS16");
-            bbConfigureIQDataType(deviceId, bbDataType16sc);
-        } else {
-            throw std::runtime_error("setupStream: Invalid format '" + format
-                            + "' -- Only CF32 and CS16 are supported by SoapyBB60C module.");
-        }
+        dataFormat = format;
+        configStream();
 
         return (SoapySDR::Stream*) this;
     }
 
     void closeStream(SoapySDR::Stream *stream) 
     {
+        const std::lock_guard<std::mutex> lock(devMutex);
         bbAbort(deviceId);
         streamActive = false;
     }
@@ -295,6 +278,7 @@ public:
                        const long long timeNs = 0,
                        const size_t numElems = 0) 
     {
+        const std::lock_guard<std::mutex> lock(devMutex);
         if (flags != 0) {
             return SOAPY_SDR_NOT_SUPPORTED;
         }
@@ -303,28 +287,16 @@ public:
             return 0;
         }
 
-        // Choose the smaller - bandwidth or sample rate
-        double actualBW = std::min(bb60Decimation.at(decimation), bandwidth);
-        bbStatus status = bbConfigureIQ(deviceId, decimation, actualBW);
-        if (status != bbNoError) {
-            SoapySDR_logf(SOAPY_SDR_ERROR, "ConfigureIQ: %s", bbGetErrorString(status));
-        }
-
         // Initiate stream
-        status = bbInitiate(deviceId, BB_STREAMING, BB_STREAM_IQ);
-        if(status != bbNoError) {
-            SoapySDR_logf(SOAPY_SDR_ERROR, "Initiate: %s", bbGetErrorString(status));
-            return SOAPY_SDR_STREAM_ERROR;
-        }
-        streamActive = true;
+        initStream();
         return 0;
-
     }
 
     int deactivateStream(SoapySDR::Stream *stream, 
                          const int flags = 0, 
                          const long long timeNs = 0) 
     {
+        const std::lock_guard<std::mutex> lock(devMutex);
         if(flags != 0 || timeNs != 0) {
             return SOAPY_SDR_NOT_SUPPORTED;
         }
@@ -340,12 +312,13 @@ public:
                    long long &timeNs,
                    const long timeoutUs = 100000) 
     {
+        const std::lock_guard<std::mutex> lock(devMutex);
         bbIQPacket pkt;
         memset(&pkt, 0, sizeof(pkt));
         pkt.iqData = buffs[0];
         pkt.iqCount = numElems;
-
         bbStatus status = bbGetIQ(deviceId, &pkt);
+
         if (status != bbNoError) {
             SoapySDR_logf(SOAPY_SDR_ERROR, "GetIQ: %s", bbGetErrorString(status));
             return 0;
@@ -389,47 +362,19 @@ public:
 
         results.push_back("RF");
         results.push_back("ATT");
-        results.push_back("REF");
 
         return results;
     }
 
     bool hasGainMode(const int direction, const size_t channel) const {
-        return true;
+        return false;
     }
 
-    void setGainMode(const int direction, const size_t channel, const bool automatic) 
+    void setGain(const int direction,
+		         const size_t channel,
+		         const double value )
     {
-        gainMode = automatic;
-        double atten = -attenLevel;
-        int gain = rfGain;
-
-        if(automatic) {
-            gain = BB_AUTO_GAIN;
-            atten = BB_AUTO_ATTEN;
-        }
-
-        bbStatus status = bbConfigureGain(deviceId, gain);
-        if(status != bbNoError) {
-            SoapySDR_logf(SOAPY_SDR_ERROR, "ConfigureGain: %s", bbGetErrorString(status));
-        }
-
-        status = bbConfigureLevel(deviceId, refLevel, atten);
-        if(status != bbNoError) {
-            SoapySDR_logf(SOAPY_SDR_ERROR, "ConfigureLevel: %s", bbGetErrorString(status));
-        }
-        if(streamActive) {
-            bbStatus status = bbInitiate(deviceId, BB_STREAMING, BB_STREAM_IQ);
-            if(status != bbNoError) {
-                SoapySDR_logf(SOAPY_SDR_ERROR, "Initiate: %s", bbGetErrorString(status));
-            }
-        }
-        return;
-    }
-
-    bool getGainMode(const int direction, const size_t channel) const 
-    {
-        return gainMode;
+        // Do nothing
     }
 
     void setGain(const int direction, 
@@ -437,62 +382,52 @@ public:
                  const std::string &name, 
                  const double value) 
     {
-        bool useref = true;
+        const std::lock_guard<std::mutex> lock(devMutex);
         if(name == "RF") {
             rfGain = value;
-            useref = false;
         } else if(name == "ATT") {
             attenLevel = value;
-            useref = false;
-        } else if(name == "REF") {
-            refLevel = value;
-            useref = true;
         } else {
             throw std::runtime_error(std::string("Unknown GAIN ")+name);
         }
-
-        setGainMode(direction, channel, useref);
+        reconfigure();
     }
 
     double getGain(const int direction, const size_t channel, const std::string &name) const 
     {
+        const std::lock_guard<std::mutex> lock(devMutex);
         if(name=="RF") {
-            if(gainMode) {
-                return 0.0;
-            } else {
-                return rfGain;
-            }
+            return rfGain;
         } else if(name=="ATT") {
-            if(gainMode) {
-                return -BB_MAX_ATTENUATION;
-            } else {
-                return attenLevel;
-            }
-        } else if(name=="REF") {
-            if(gainMode) {
-                return refLevel;
-            } else {
-                return -120.0;
-            }
-        }
+            return attenLevel;
+        } 
 
         throw std::runtime_error(std::string("Unsupported GAIN ")+name);
 
         return 0.0;
     }
 
+    double getGain(const int direction,
+		         const size_t channel)
+    {
+        return rfGain + attenLevel;
+    }
+
     SoapySDR::Range getGainRange(const int direction, const size_t channel, const std::string &name) const 
     {
-        if(name == "ATT") {
-            return SoapySDR::Range(-30, 0);
-        }
-
-        if(name == "RF") {
-            return SoapySDR::Range(0, 20);
-        }
-
-        if(name == "REF") {
-            return SoapySDR::Range(-120, 20);
+        
+        if(type == BB_DEVICE_BB60C) {
+            if(name == "ATT") {
+                return SoapySDR::Range(-30, 0);
+            } else if(name == "RF") {
+                return SoapySDR::Range(0, 35);
+            }
+        } else if(type == BB_DEVICE_BB60D) {
+            if(name == "ATT") {
+                return SoapySDR::Range(-30, 0);
+            } else if(name == "RF") {
+                return SoapySDR::Range(0, 20);
+            }
         }
 
         throw std::runtime_error(std::string("Unsupported gain: ") + name);
@@ -518,23 +453,13 @@ public:
                      const double frequency, 
                      const SoapySDR::Kwargs &args) 
     {
+        const std::lock_guard<std::mutex> lock(devMutex);
         if(name != "RF") {
             SoapySDR_logf(SOAPY_SDR_ERROR, "setFrequency: invalid name");
             return;
         }
         centerFrequency = (double)frequency;
-
-        bbStatus status = bbConfigureIQCenter(deviceId, centerFrequency);
-        if (status != bbNoError) {
-            SoapySDR_logf(SOAPY_SDR_ERROR, "ConfigureIQCenter: %s", bbGetErrorString(status));
-        }
-
-        if(streamActive) {
-            bbStatus status = bbInitiate(deviceId, BB_STREAMING, BB_STREAM_IQ);
-            if(status != bbNoError) {
-                SoapySDR_logf(SOAPY_SDR_ERROR, "Initiate: %s", bbGetErrorString(status));
-            }
-        }
+        reconfigure();
         return;
     }
 
@@ -545,6 +470,7 @@ public:
 
     double getFrequency(const int direction, const size_t channel, const std::string &name) const 
     {
+        const std::lock_guard<std::mutex> lock(devMutex);
         if(name == "RF") {
             return (double)centerFrequency;
         }
@@ -589,6 +515,7 @@ public:
 
     void setSampleRate(const int direction, const size_t channel, const double rate) 
     {
+        const std::lock_guard<std::mutex> lock(devMutex);
         if(sampleRate != rate) {
             auto revii = bb60Decimation.rbegin();
             int dec = revii->first;
@@ -607,11 +534,14 @@ public:
             std::stringstream sstream;
             sstream << "BB60 set decimation " << decimation << " BW " << bw/1e6 << "MHz SR: " << BB60_CLOCK/decimation/1e6 << "MHz";
             SoapySDR_log(SOAPY_SDR_INFO, sstream.str().c_str());
+
+            reconfigure();
         }
     }
 
     double getSampleRate(const int direction, const size_t channel) const 
     {
+        const std::lock_guard<std::mutex> lock(devMutex);
         return BB60_CLOCK/decimation;
     }
 
@@ -643,11 +573,14 @@ public:
 
     void setBandwidth(const int direction, const size_t channel, const double bw) 
     {
+        const std::lock_guard<std::mutex> lock(devMutex);
         bandwidth = std::min(bb60Decimation.at(decimation), bw);
+        reconfigure();
     }
 
     double getBandwidth(const int direction, const size_t channel) const 
     {
+        const std::lock_guard<std::mutex> lock(devMutex);
         return bandwidth;
     }
 
@@ -742,15 +675,16 @@ public:
 
     void writeSetting(const std::string &key, const std::string &value) 
     {
+        const std::lock_guard<std::mutex> lock(devMutex);
         if(key == "port1" && port1_config.count(value) > 0) {
             port1 = port1_config.at(value);
-            configIO();
+            reconfigure();
             return;
         }
 
         if(key == "port2" && port2_config.count(value) > 0) {
             port2 = port2_config.at(value);
-            configIO();
+            reconfigure();
             return;
         }
 
@@ -759,6 +693,7 @@ public:
 
     std::string readSetting(const std::string &key) const 
     {
+        const std::lock_guard<std::mutex> lock(devMutex);
         if(key == "port1") {
             std::string ret = "UNKNOWN";
             for(auto &ii: port1_config) {
@@ -796,21 +731,98 @@ public:
     }
 
     /*******************************************************************
-     * Input/Output API
+     * Util API
      ******************************************************************/
 
-    void configIO(void) const 
+    void configStream()
     {
-        if(!streamActive) {
-            bbStatus status = bbConfigureIO(deviceId, port1, port2);
-            if(status != bbNoError) {
-                SoapySDR_logf(SOAPY_SDR_ERROR, "ConfigureIO: %s", bbGetErrorString(status));
-            } else {
-                SoapySDR_logf(SOAPY_SDR_INFO, "ConfigureIO: %d %d", port1, port2);
-            }
+        bbStatus status = bbNoError;
+        streamActive = false;
+        status = bbAbort(deviceId);
+            
+
+        // Check format
+        if(dataFormat == SOAPY_SDR_CF32) {
+            SoapySDR_log(SOAPY_SDR_INFO, "Using format CF32");
+            bbConfigureIQDataType(deviceId, bbDataType32fc);
+        } else if(dataFormat == SOAPY_SDR_CS16) {
+            SoapySDR_log(SOAPY_SDR_INFO, "Using format CS16");
+            bbConfigureIQDataType(deviceId, bbDataType16sc);
         } else {
-            SoapySDR_logf(SOAPY_SDR_WARNING, "Can't configureIO while streaming");
+            throw std::runtime_error("setupStream: Invalid format '" + dataFormat
+                            + "' -- Only CF32 and CS16 are supported by SoapyBB60C module.");
         }
+
+        // BB60 Gain and Atten are kind of funky an you don't have 1db resolution so the below logic converts
+        // or gain and atten from db values to the values used by the signalhound api. See bbConfigureGainAtten 
+        // documentation to see the relationship.
+        // https://signalhound.com/sigdownloads/SDK/online_docs/bb_api/bb__api_8h.html
+        int actualGain = 0;
+        if(type == BB_DEVICE_BB60C) {
+            if(rfGain < 2.5) {
+                actualGain = 0;
+            } else if(rfGain < 17.5) {
+                actualGain = 1;
+            } else if(rfGain < 32.5) {
+                actualGain = 2;
+            } else {
+                actualGain = 3;
+            } 
+        }  else if(type == BB_DEVICE_BB60D) {
+            if(rfGain < 2.5) {
+                actualGain = 0;
+            } else if(rfGain  < 10) {
+                actualGain = 1;
+            } else if(rfGain < 17.5) {
+                actualGain = 2;
+            } else {
+                actualGain = 3;
+            } 
+        }
+
+        int actualAtten = (int)attenLevel / -10;
+
+        status = bbConfigureGainAtten(deviceId, actualGain, actualAtten);
+        if(status != bbNoError) {
+            SoapySDR_logf(SOAPY_SDR_ERROR, "ConfigureGainAtten: %s", bbGetErrorString(status));
+        }
+        // Set a sample rate of 40MS/s and a bandwidth of 27MHz
+        status = bbConfigureIQCenter(deviceId, centerFrequency);
+        SoapySDR_logf(SOAPY_SDR_ERROR, "ConfigureIQCenter: %lf", centerFrequency);
+        if (status != bbNoError) {
+            SoapySDR_logf(SOAPY_SDR_ERROR, "ConfigureIQCenter: %s", bbGetErrorString(status));
+        }
+
+        status = bbConfigureIO(deviceId, port1, port2);
+        if(status != bbNoError) {
+            SoapySDR_logf(SOAPY_SDR_ERROR, "ConfigureIO: %s", bbGetErrorString(status));
+        } else {
+            SoapySDR_logf(SOAPY_SDR_INFO, "ConfigureIO: %d %d", port1, port2);
+        }
+
+        // Choose the smaller - bandwidth or sample rate
+        double actualBW = std::min(bb60Decimation.at(decimation), bandwidth);
+        status = bbConfigureIQ(deviceId, decimation, actualBW);
+        if (status != bbNoError) {
+            SoapySDR_logf(SOAPY_SDR_ERROR, "ConfigureIQ: %s", bbGetErrorString(status));
+        }
+    }
+
+    void initStream()
+    {
+        // Initiate the device, once this function returns the device
+        // will be streaming I/Q.
+        status = bbInitiate(deviceId, BB_STREAMING, BB_STREAM_IQ);
+        if(status != bbNoError) {
+            SoapySDR_logf(SOAPY_SDR_ERROR, "Initiate: %s", bbGetErrorString(status));
+        }
+        streamActive = true;
+    }
+
+    void reconfigure()
+    {
+        configStream();
+        initStream();
     }
 };
 
